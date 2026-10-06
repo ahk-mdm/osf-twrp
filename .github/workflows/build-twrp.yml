@@ -1,0 +1,120 @@
+name: Build TWRP
+
+on:
+  push:
+    branches:
+      - A17
+      - A14
+  pull_request:
+    branches:
+      - A17
+      - A14
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Prepare Build Environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git-core gnupg flex bison gperf build-essential zip curl zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses-dev libncurses5-dev libncurses5 x11proto-core-dev libx11-dev lib32z-dev libgl1-mesa-dev libxml2-utils xsltproc unzip python3 python3-pip repo
+
+    - name: Configure Git
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+
+    - name: Initialize TWRP Manifest
+      run: |
+        cd /tmp
+        mkdir twrp
+        cd twrp
+        repo init -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp -b twrp-12.1 --depth=1
+        repo sync -j$(nproc --all) --force-sync
+
+    - name: Add Device Tree
+      run: |
+        cd /tmp/twrp
+        mkdir -p device/google/raven
+        # Copy all files except .git, log, .gitignore
+        for file in $GITHUB_WORKSPACE/*; do
+          if [ "$(basename "$file")" != ".git" ] && [ "$(basename "$file")" != "log" ] && [ "$(basename "$file")" != ".gitignore" ]; then
+            cp -r "$file" device/google/raven/
+          fi
+        done
+        ls -la device/google/raven/
+
+    - name: Build TWRP
+      run: |
+        cd /tmp/twrp
+        ls -la device/google/
+        ls -la device/google/raven/
+        source build/envsetup.sh
+        lunch twrp_raven-eng
+
+        echo "=== Attempting build approach 1: mka bootimage recoveryimage ==="
+        set +e
+        mka bootimage recoveryimage -j$(nproc --all)
+        RC1=$?
+        echo "Approach 1 exit code: $RC1"
+
+        echo "=== Checking output after approach 1 ==="
+        ls -la out/target/product/raven/*.img 2>/dev/null || echo "No .img files yet"
+
+        echo "=== Attempting build approach 2: make recoveryimage (no parallelism for debug) ==="
+        make recoveryimage -j1 2>&1 | tail -50
+        RC2=$?
+        echo "Approach 2 exit code: $RC2"
+
+        echo "=== Attempting build approach 3: make bootimage ==="
+        make bootimage -j$(nproc --all) 2>&1 | tail -50
+        RC3=$?
+        echo "Approach 3 exit code: $RC3"
+
+        echo "=== Final output check ==="
+        ls -la out/target/product/raven/*.img 2>/dev/null || echo "Still no .img files"
+
+        set -e
+        if [ -f out/target/product/raven/boot.img ] || [ -f out/target/product/raven/recovery.img ]; then
+          echo "SUCCESS: At least one image file was produced!"
+        else
+          echo "WARNING: No image files produced. Dumping diagnostic info..."
+          echo "=== ninja targets for bootimage ==="
+          ninja -f out/build-twrp_raven.ninja -t commands bootimage 2>/dev/null | head -30 || echo "Could not dump ninja commands for bootimage"
+          echo "=== ninja targets for recoveryimage ==="
+          ninja -f out/build-twrp_raven.ninja -t commands recoveryimage 2>/dev/null | head -30 || echo "Could not dump ninja commands for recoveryimage"
+          echo "=== All ninja targets containing 'boot' ==="
+          ninja -f out/build-twrp_raven.ninja -t targets all 2>/dev/null | grep -i boot | head -20 || echo "No boot-related targets found"
+          echo "=== All ninja targets containing 'recovery' ==="
+          ninja -f out/build-twrp_raven.ninja -t targets all 2>/dev/null | grep -i recovery | head -20 || echo "No recovery-related targets found"
+        fi
+
+    - name: Verify Build Output
+      run: |
+        cd /tmp/twrp
+        echo "=== Output directory full listing ==="
+        ls -laR out/target/product/raven/ 2>/dev/null || echo "Product directory not found"
+        echo ""
+        echo "=== All image files in entire out/ tree ==="
+        find out/ -name "*.img" -type f 2>/dev/null | head -30 || echo "No image files found anywhere in out/"
+
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: twrp-raven
+        path: |
+          /tmp/twrp/out/target/product/raven/boot.img
+          /tmp/twrp/out/target/product/raven/recovery.img
+          /tmp/twrp/out/target/product/raven/vendor_boot.img
+          /tmp/twrp/out/target/product/raven/dtbo.img
+          /tmp/twrp/out/target/product/raven/*.img
+        if-no-files-found: error
+        compression-level: 6
+        retention-days: 30
